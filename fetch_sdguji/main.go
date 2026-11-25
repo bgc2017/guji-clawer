@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math/rand"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -12,21 +14,28 @@ import (
 )
 
 func main() {
+	// 先切控制台编码，否则 Windows 上 -h / 参数报错里的中文就已经乱码了
+	initConsole()
+
 	var (
-		bookArg  string
-		outRoot  string
-		lang     string
-		visible  bool
-		images   bool
-		delayMS  int
-		timeoutS int
-		force    bool
-		only     string
-		from     string
-		maxN     int
-		listOnly bool
-		rawDump  bool
-		verbose  bool
+		bookArg   string
+		outRoot   string
+		lang      string
+		visible   bool
+		images    bool
+		delayMS   int
+		timeoutS  int
+		force     bool
+		only      string
+		from      string
+		maxN      int
+		listOnly  bool
+		rawDump   bool
+		verbose   bool
+		textMode  string
+		chrome    string
+		userAgent string
+		proxy     string
 	)
 	flag.StringVar(&bookArg, "book", "", "图书 URL 或 ID，例如 https://www.shidianguji.com/book/CADAL01023318")
 	flag.StringVar(&outRoot, "out", "books", "输出根目录")
@@ -42,7 +51,15 @@ func main() {
 	flag.BoolVar(&listOnly, "list", false, "只打印目录，不下载")
 	flag.BoolVar(&rawDump, "raw", false, "每章额外保存原始段落 JSON")
 	flag.BoolVar(&verbose, "v", false, "输出调试信息")
+	flag.StringVar(&textMode, "text", "trad", "正文字形：trad 标准繁体（默认）/ simp 机器简体 / orig 站点原文")
+	flag.StringVar(&chrome, "chrome", "", "浏览器可执行文件路径（默认自动探测，Windows 如 C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe）")
+	flag.StringVar(&userAgent, "ua", "", "自定义 User-Agent（默认按当前系统生成）")
+	flag.StringVar(&proxy, "proxy", "", "浏览器代理地址，例如 http://127.0.0.1:7890")
 	flag.Parse()
+
+	if err := setTextMode(textMode); err != nil {
+		fatal(err)
+	}
 
 	if strings.TrimSpace(bookArg) == "" {
 		flag.Usage()
@@ -58,16 +75,29 @@ func main() {
 	}
 
 	b, err := NewBrowser(browserOptions{
-		visible: visible,
-		images:  images,
-		timeout: time.Duration(timeoutS) * time.Second,
-		lang:    lang,
-		verbose: verbose,
+		visible:    visible,
+		images:     images,
+		timeout:    time.Duration(timeoutS) * time.Second,
+		lang:       lang,
+		verbose:    verbose,
+		chromePath: chrome,
+		userAgent:  userAgent,
+		proxy:      proxy,
 	})
 	if err != nil {
 		fatal(err)
 	}
 	defer b.Close()
+
+	// Ctrl+C（Windows 下也适用）：先关浏览器再退出，避免留下无头 chrome 进程
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	go func() {
+		<-sigCh
+		fmt.Println("\n已中断，正在关闭浏览器…")
+		b.Close()
+		os.Exit(1)
+	}()
 
 	start := time.Now()
 	fmt.Printf("站点: shidianguji.com  图书: %s  语言: %s\n", bookID, lang)
@@ -105,6 +135,7 @@ func main() {
 	})
 	totalPages := first.TotalPage
 	fmt.Printf("书目: 《%s》 %s，共 %d 章 / %d 页\n", bookName, author, countChapters(catalog), totalPages)
+	fmt.Printf("正文: %s\n", textModeName())
 
 	// 3) 输出目录与书目清单
 	dir := filepath.Join(outRoot, safeName(bookID+"-"+bookName))
@@ -139,7 +170,34 @@ func main() {
 		TotalPage: totalPages,
 		Chapters:  records,
 		CrawledAt: nowStamp(),
-		Version:   "2.0",
+		TextMode:  textModeName(),
+		Version:   "2.1",
+	}
+
+	// 读取上次的清单：断点续抓时要按「每章记录的文本模式」判断旧文件是否还能用，
+	// 换了 -text 后旧字形的文件不能被当成已缓存跳过。
+	if raw, err := os.ReadFile(filepath.Join(dir, "book.json")); err == nil {
+		var old Manifest
+		if json.Unmarshal(raw, &old) == nil {
+			oldModes := make(map[string]string, len(old.Chapters))
+			for _, r := range old.Chapters {
+				if r.TextMode != "" {
+					oldModes[r.ID] = r.TextMode
+				}
+			}
+			need := 0
+			for i := range records {
+				if mode, ok := oldModes[records[i].ID]; ok {
+					records[i].TextMode = mode
+					if mode != m.TextMode {
+						need++
+					}
+				}
+			}
+			if need > 0 && !listOnly {
+				fmt.Printf("本地有 %d 章是旧字形（%s），将用「%s」重新抓取\n", need, old.TextMode, m.TextMode)
+			}
+		}
 	}
 
 	// 4) 选择要抓的章节范围
@@ -174,8 +232,8 @@ func main() {
 		path := filepath.Join(dir, rec.File)
 		label := fmt.Sprintf("[%d/%d] %s", idxNo+1, len(sel), rec.Title)
 
-		// 断点续抓：已有非空文件直接跳过
-		if !force {
+		// 断点续抓：文件存在、且记录的文本模式与本次一致才跳过
+		if !force && rec.TextMode == m.TextMode {
 			if st, err := os.Stat(path); err == nil && st.Size() > 0 {
 				rec.Chars, rec.Paragraphs = countFileChars(path)
 				rec.Status = "cached"
@@ -231,6 +289,7 @@ func main() {
 		if nRaw > 1 {
 			paras = stripLeadingTitle(paras, rec.Title)
 		}
+		paras = convAll(paras)
 
 		if len(paras) == 0 {
 			rec.Status = "empty"
@@ -247,6 +306,7 @@ func main() {
 		}
 
 		rec.Status = "done"
+		rec.TextMode = m.TextMode
 		if _, werr = writeChapterFile(path, rec, paras); werr != nil {
 			rec.Status = "failed"
 			rec.Note = werr.Error()
@@ -373,13 +433,14 @@ func matchChapters(records []ChapterRecord, kw string) map[int]bool {
 		contains := map[int]bool{}
 		for i, r := range records {
 			tn := norm(r.Title)
+			tc := norm(convText(r.Title))
 			switch {
-			case p == r.ID || pn == tn:
+			case p == r.ID || pn == tn || pn == tc:
 				exact[i] = true
-			case strings.HasSuffix(tn, pn):
+			case strings.HasSuffix(tn, pn) || strings.HasSuffix(tc, pn):
 				suffix[i] = true
 			}
-			if strings.Contains(tn, pn) {
+			if strings.Contains(tn, pn) || strings.Contains(tc, pn) {
 				contains[i] = true
 			}
 		}

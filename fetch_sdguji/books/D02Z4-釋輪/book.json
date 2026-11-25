@@ -1,0 +1,26 @@
+{
+  "book_id": "D02Z4",
+  "book_name": "釋輪",
+  "author": "[清] 焦循 著",
+  "dynasty": "清",
+  "source_url": "https://www.shidianguji.com/zh/book/D02Z4",
+  "total_page": 52,
+  "chapters": [
+    {
+      "index": 1,
+      "chapter_id": "1l4kplvcc86qr",
+      "title": "釋輪卷上",
+      "start_page": 1,
+      "end_page": 52,
+      "expected_paragraphs": 67,
+      "paragraphs": 42,
+      "chars": 4762,
+      "file": "001_釋輪卷上.txt",
+      "status": "done",
+      "note": "段落数少于目录标注（42/67），可能被截断",
+      "elapsed_ms": 0
+    }
+  ],
+  "crawled_at": "2026-11-25 08:47:11",
+  "version": "2.0"
+}

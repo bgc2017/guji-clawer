@@ -1,0 +1,39 @@
+{
+  "book_id": "D05Z5",
+  "book_name": "釋橢",
+  "author": "[清] 焦循 著",
+  "dynasty": "清",
+  "source_url": "https://www.shidianguji.com/zh/book/D05Z5",
+  "total_page": 61,
+  "chapters": [
+    {
+      "index": 1,
+      "chapter_id": "1l3ohyuexh2ix",
+      "title": "釋橢序",
+      "start_page": 1,
+      "end_page": 8,
+      "expected_paragraphs": 6,
+      "paragraphs": 5,
+      "chars": 1120,
+      "file": "001_釋橢序.txt",
+      "status": "done",
+      "elapsed_ms": 0
+    },
+    {
+      "index": 2,
+      "chapter_id": "1l3ohyuexhf61",
+      "title": "釋橢",
+      "start_page": 9,
+      "end_page": 61,
+      "expected_paragraphs": 133,
+      "paragraphs": 91,
+      "chars": 6555,
+      "file": "002_釋橢.txt",
+      "status": "done",
+      "note": "段落数少于目录标注（92/133），可能被截断",
+      "elapsed_ms": 2831
+    }
+  ],
+  "crawled_at": "2026-11-25 08:47:27",
+  "version": "2.0"
+}

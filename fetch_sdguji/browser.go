@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -16,7 +17,84 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-const defaultUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+// 默认 UA 按运行平台生成，Windows / macOS / Linux 各用各的，避免和真实系统不一致。
+func defaultUserAgent() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	case "darwin":
+		return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	default:
+		return "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	}
+}
+
+// 浏览器候选路径：按当前系统给，Windows 下包括 Chrome 与 Edge（都基于 Chromium）。
+func chromeCandidates() []string {
+	switch runtime.GOOS {
+	case "windows":
+		var list []string
+		add := func(dir, exe string) {
+			if dir != "" {
+				list = append(list, filepath.Join(dir, exe))
+			}
+		}
+		pf := os.Getenv("ProgramFiles")
+		pf86 := os.Getenv("ProgramFiles(x86)")
+		local := os.Getenv("LOCALAPPDATA")
+		add(pf, `Google\Chrome\Application\chrome.exe`)
+		add(pf86, `Google\Chrome\Application\chrome.exe`)
+		add(local, `Google\Chrome\Application\chrome.exe`)
+		add(pf86, `Microsoft\Edge\Application\msedge.exe`)
+		add(pf, `Microsoft\Edge\Application\msedge.exe`)
+		// 少数机器装在默认路径但环境变量缺失
+		list = append(list,
+			`C:\Program Files\Google\Chrome\Application\chrome.exe`,
+			`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
+		)
+		return list
+	case "darwin":
+		return []string{
+			"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+			"/Applications/Chromium.app/Contents/MacOS/Chromium",
+			"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+		}
+	default:
+		return []string{
+			"/usr/bin/google-chrome",
+			"/usr/bin/google-chrome-stable",
+			"/usr/bin/chromium",
+			"/usr/bin/chromium-browser",
+		}
+	}
+}
+
+// findChrome 的优先级：命令行 -chrome > 环境变量 SDG_CHROME > 系统常见路径。
+func findChrome(explicit string) (string, error) {
+	if explicit != "" {
+		if _, err := os.Stat(explicit); err != nil {
+			return "", fmt.Errorf("指定的浏览器路径不可用: %s", explicit)
+		}
+		return explicit, nil
+	}
+	if p := os.Getenv("SDG_CHROME"); p != "" {
+		if _, err := os.Stat(p); err != nil {
+			return "", fmt.Errorf("环境变量 SDG_CHROME 指向的文件不存在: %s", p)
+		}
+		return p, nil
+	}
+	cands := chromeCandidates()
+	for _, p := range cands {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	hint := "未找到 Chrome 或 Edge，请安装 Chrome，或用 -chrome 参数 / 环境变量 SDG_CHROME 指定路径"
+	if len(cands) > 0 {
+		hint += "\n已尝试: " + strings.Join(cands, "\n        ")
+	}
+	return "", fmt.Errorf("%s", hint)
+}
 
 // Browser 封装一个真实的 Chrome 标签页，所有请求都由浏览器自己发出。
 type Browser struct {
@@ -31,47 +109,30 @@ type Browser struct {
 }
 
 type browserOptions struct {
-	visible bool
-	images  bool
-	timeout time.Duration
-	lang    string
-	verbose bool
-}
-
-// 常见 Chrome/Chromium 安装位置
-var chromePaths = []string{
-	"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-	"/Applications/Chromium.app/Contents/MacOS/Chromium",
-	"/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-	"/usr/bin/google-chrome",
-	"/usr/bin/google-chrome-stable",
-	"/usr/bin/chromium",
-	"/usr/bin/chromium-browser",
-	`C:\Program Files\Google\Chrome\Application\chrome.exe`,
-	`C:\Program Files (x86)\Google\Chrome\Application\chrome.exe`,
-}
-
-func findChrome() string {
-	if p := os.Getenv("SDG_CHROME"); p != "" {
-		return p
-	}
-	for _, p := range chromePaths {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return ""
+	visible    bool
+	images     bool
+	timeout    time.Duration
+	lang       string
+	verbose    bool
+	chromePath string
+	userAgent  string
+	proxy      string
 }
 
 func NewBrowser(o browserOptions) (*Browser, error) {
-	path := findChrome()
-	if path == "" {
-		return nil, fmt.Errorf("未找到 Chrome/Chromium，请安装，或用环境变量 SDG_CHROME 指定可执行文件路径")
+	path, err := findChrome(o.chromePath)
+	if err != nil {
+		return nil, err
+	}
+
+	ua := o.userAgent
+	if ua == "" {
+		ua = defaultUserAgent()
 	}
 
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.ExecPath(path),
-		chromedp.UserAgent(defaultUA),
+		chromedp.UserAgent(ua),
 		chromedp.WindowSize(1440, 960),
 		chromedp.Flag("enable-automation", false),
 		chromedp.Flag("disable-blink-features", "AutomationControlled"),
@@ -79,6 +140,15 @@ func NewBrowser(o browserOptions) (*Browser, error) {
 		chromedp.Flag("no-first-run", true),
 		chromedp.Flag("disable-notifications", true),
 	)
+	if o.proxy != "" {
+		opts = append(opts, chromedp.ProxyServer(o.proxy))
+	}
+	if o.verbose {
+		fmt.Printf("浏览器: %s\nUA: %s\n", path, ua)
+		if o.proxy != "" {
+			fmt.Printf("代理: %s\n", o.proxy)
+		}
+	}
 	if o.visible {
 		// 去掉 headless 等隐藏窗口的开关
 		opts = append(opts, chromedp.VisibleWindow)
@@ -124,6 +194,18 @@ func NewBrowser(o browserOptions) (*Browser, error) {
 	// 禁用缓存，保证每次都能拿到完整的响应体。
 	_ = chromedp.Do(ctx, chromedp.Func(func(c context.Context, t *chromedp.Target) error {
 		if _, err := cdp.Call(c, t, network.Enable, network.EnableParams{}); err != nil {
+			return err
+		}
+		// 同步站点的字形偏好：__is_simplified 0=标准繁体 1=机器简体 2=原文。
+		// 这个 cookie 只影响阅读器显示与页面元信息，SSR 正文仍是原书字形，
+		// 所以正文转换仍由本地字典完成（见 convert.go）。
+		cookie := network.SetCookieParams{
+			Name:   "__is_simplified",
+			Value:  textModeCookieValue(),
+			Domain: "shidianguji.com",
+			Path:   "/",
+		}
+		if _, err := cdp.Call(c, t, network.SetCookie, cookie); err != nil {
 			return err
 		}
 		_, err := cdp.Call(c, t, network.SetCacheDisabled, network.SetCacheDisabledParams{CacheDisabled: true})

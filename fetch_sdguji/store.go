@@ -24,6 +24,7 @@ type ChapterRecord struct {
 	File       string `json:"file"`
 	Status     string `json:"status"` // done / cached / failed / empty
 	Note       string `json:"note,omitempty"`
+	TextMode   string `json:"text_mode,omitempty"` // 该章文件实际使用的字形
 	ElapsedMS  int64  `json:"elapsed_ms"`
 }
 
@@ -36,6 +37,7 @@ type Manifest struct {
 	TotalPage int             `json:"total_page"`
 	Chapters  []ChapterRecord `json:"chapters"`
 	CrawledAt string          `json:"crawled_at"`
+	TextMode  string          `json:"text_mode"`
 	Version   string          `json:"version"`
 }
 
@@ -47,6 +49,21 @@ func safeName(s string) string {
 		"\n", "", "\r", "", "\t", "", " ", "",
 	)
 	s = repl.Replace(s)
+	// 去掉控制字符与结尾的点/空格（Windows 会拒绝对这类文件名做某些操作）
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimRight(s, ". ")
+	// Windows 保留设备名不能直接当文件名
+	switch strings.ToUpper(s) {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9":
+		s += "_"
+	}
 	if s == "" {
 		s = "untitled"
 	}
@@ -54,6 +71,16 @@ func safeName(s string) string {
 		s = string([]rune(s)[:60])
 	}
 	return s
+}
+
+// withPlatformNL 统一换行：Windows 用 CRLF，其它系统用 LF。
+// 先归一成 LF 再换，避免读进来的 CRLF 变成 \r\r\n。
+func withPlatformNL(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	if platformNL() == "\n" {
+		return s
+	}
+	return strings.ReplaceAll(s, "\n", platformNL())
 }
 
 func saveJSON(path string, v any) error {
@@ -70,7 +97,7 @@ func saveJSON(path string, v any) error {
 
 func (r *ChapterRecord) header() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s\n", r.Title)
+	fmt.Fprintf(&b, "%s\n", convText(r.Title))
 	if r.EndPage > r.StartPage {
 		fmt.Fprintf(&b, "（第%d–%d页）\n", r.StartPage, r.EndPage)
 	} else if r.StartPage > 0 {
@@ -94,7 +121,7 @@ func writeChapterFile(path string, rec *ChapterRecord, paras []string) (int, err
 		chars += utf8.RuneCountInString(t)
 		n++
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(withPlatformNL(b.String())), 0o644); err != nil {
 		return 0, err
 	}
 	rec.Chars = chars
@@ -107,7 +134,7 @@ func countFileChars(path string) (int, int) {
 	if err != nil {
 		return 0, 0
 	}
-	text := string(data)
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := 0
 	for _, l := range strings.Split(text, "\n") {
 		if strings.TrimSpace(l) != "" {
@@ -120,7 +147,7 @@ func countFileChars(path string) (int, int) {
 // writeCombined 把各章拼成全本。
 func writeCombined(dir, bookName, author string, m *Manifest) (string, error) {
 	var b strings.Builder
-	fmt.Fprintf(&b, "《%s》\n", bookName)
+	fmt.Fprintf(&b, "《%s》\n", convText(bookName))
 	if author != "" {
 		fmt.Fprintf(&b, "%s\n", author)
 	}
@@ -147,7 +174,7 @@ func writeCombined(dir, bookName, author string, m *Manifest) (string, error) {
 		}
 
 		b.WriteString("\n")
-		fmt.Fprintf(&b, "==================== [%03d] %s", rec.Index, rec.Title)
+		fmt.Fprintf(&b, "==================== [%03d] %s", rec.Index, convText(rec.Title))
 		if rec.EndPage > rec.StartPage {
 			fmt.Fprintf(&b, " （第%d–%d页）", rec.StartPage, rec.EndPage)
 		} else if rec.StartPage > 0 {
@@ -159,7 +186,7 @@ func writeCombined(dir, bookName, author string, m *Manifest) (string, error) {
 
 	name := safeName(bookName) + "_全本.txt"
 	path := filepath.Join(dir, name)
-	return path, os.WriteFile(path, []byte(b.String()), 0o644)
+	return path, os.WriteFile(path, []byte(withPlatformNL(b.String())), 0o644)
 }
 
 func nowStamp() string { return time.Now().Format("2006-01-02 15:04:05") }
