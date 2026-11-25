@@ -1,0 +1,184 @@
+from playwright.sync_api import sync_playwright
+from urllib.parse import urljoin
+import sys
+from bs4 import BeautifulSoup
+import time
+
+def next_chapter(mark_chapter, init_chapters):
+    """
+    返回 mark_chapter 在列表中的下一個元素，如果沒有返回 None
+    """
+    try:
+        idx = init_chapters.index(mark_chapter)
+        if idx + 1 < len(init_chapters):
+            return init_chapters[idx + 1]
+        else:
+            return None  # 已經是最後一個元素
+    except ValueError:
+        return None  # mark_chapter 不在列表中
+
+def remove_adjacent_duplicates(chapters):
+    """
+    移除列表中相鄰重複元素，保持原順序
+    """
+    if not chapters:
+        return []
+
+    result = [chapters[0]]  # 第一個元素直接保留
+    for item in chapters[1:]:
+        if item != result[-1]:
+            result.append(item)
+    return result
+def fetch_chapters_only(page,book_url):
+    page.goto(book_url, timeout=30000)
+    page.wait_for_load_state("networkidle")
+    html = page.content()
+
+
+    # 獲取章節列表
+    soup = BeautifulSoup(html, "html.parser")
+    
+    # 找到所有 class="title-container" 的 div
+    divs = soup.find_all("div", class_="title-container")
+    for div in divs:
+        if "AI整理" in div.get_text():
+            print("AI")
+            sys.exit(0)  # 退出整个 Python 脚本
+
+    result = []
+    div = soup.find("div", class_="semi-tree-option-list semi-tree-option-list-block")
+    a_tags = div.find_all("a", href=True)
+    if not a_tags:
+        return None
+
+    for a in a_tags:
+        name = a.text.strip()
+        url = urljoin(book_url, a["href"].strip())
+        if name and url:
+            result.append(url)
+
+    if book_url == result[-1]:
+        result=["Finished"] 
+
+    return result
+
+def fetch_chapters(page,book_url):
+    page.goto(book_url, timeout=30000)
+    page.wait_for_load_state("networkidle")
+    html = page.content()
+    # 獲取正文內容
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.find("main", class_="read-layout-main")
+    if not main:
+        print(f"❌ 未找到章节内容 main: {chapter_url}")
+        return None
+
+    p_tags = main.find_all("p")
+    if not p_tags:
+        print(f"❌ 章节内容为空: {chapter_url}")
+        return None
+
+    content = "\n".join([p.get_text(strip=True) for p in p_tags])
+    print(content)
+
+    # 獲取章節列表
+    soup = BeautifulSoup(html, "html.parser")
+    div = soup.find("div", class_="semi-tree-option-list semi-tree-option-list-block")
+    if not div:
+        print("❌ 未找到章节列表 div")
+        return None
+
+    result = []
+    a_tags = div.find_all("a", href=True)
+    if not a_tags:
+        print("❌ div 中沒有 <a> 標籤")
+        return None
+
+    for a in a_tags:
+        name = a.text.strip()
+        url = urljoin(book_url, a["href"].strip())
+        if name and url:
+            #print(f"##{name} {url}") 
+            result.append(url)
+
+    if book_url == result[-1]:
+        result=["Finished"] 
+
+    return result
+
+
+def fetch_chapter_content(page,chapter_url):
+    try:
+        page.goto(chapter_url, timeout=30000)
+        page.wait_for_load_state("networkidle")
+        html = page.content()
+    except Exception as e:
+        print(f"❌ 加载章节失败: {chapter_url} 错误: {e}")
+        page.close()
+        return None
+
+    page.close()
+
+    soup = BeautifulSoup(html, "html.parser")
+    main = soup.find("main", class_="read-layout-main")
+    if not main:
+        print(f"❌ 未找到章节内容 main: {chapter_url}")
+        return None
+
+    p_tags = main.find_all("p")
+    if not p_tags:
+        print(f"❌ 章节内容为空: {chapter_url}")
+        return None
+
+    content = "\n".join([p.get_text(strip=True) for p in p_tags])
+    return content
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("請提供書籍首頁 URL，例如：python script.py https://www.shidianguji.com/zh/book/HY0313/")
+        sys.exit(1)
+
+    base_url = sys.argv[1]
+
+    user_agent_str = "Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.2"
+
+    cookies = [
+        {"name": "gfkadpd", "value": "361265,34425", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "x-web-secsdk-uid", "value": "fd96cb3d-f6a9-4c30-ad78-eb5b92d80122", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "ttwid", "value": "1%7CjX0pEuCC1KxMUKfGzWviwJKYMJs_rN5jWAsqC6axZwo%7C1765500774%7C32381156a9fd1842c96edd4a7fc94764e04903576209e72864e246e5f132f355", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "s_v_web_id", "value": "verify_mj25ktsp_FGQlT2ck_Ie3Z_4Kbx_ARAQ_I59oPAgN4IWP", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "__is_line_comment_tip_show", "value": "1", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "__is_translate_show", "value": "0", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "__is_simplified", "value": "2", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "__is_original", "value": "1", "domain": ".shidianguji.com", "path": "/"},
+        {"name": "__is_image_close", "value": "1", "domain": ".shidianguji.com", "path": "/"},
+    ]
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=user_agent_str)
+        context.add_cookies(cookies)
+        page = context.new_page()
+
+        # 對比下一篇章是否一致
+        # fetch_chapters_only 只返回章節list
+        # fetch_chapters 返回章節list，同時打印古籍正文
+
+        init_chapters = remove_adjacent_duplicates(fetch_chapters_only(page, base_url))
+        # 第一章節URL
+        mark_chapter=init_chapters[0]
+        print(mark_chapter)
+        ## 第一章節內容
+        #fetch_chapters(page,mark_chapter)
+
+        #while mark_chapter != "Finished":
+        #    next_url=next_chapter(mark_chapter,init_chapters)
+        #    print(f"Next Chapter: {next_url}")
+
+        #    # 當前url的下一篇內容 
+        #    init_chapters = remove_adjacent_duplicates(fetch_chapters(page,next_url))
+        #    mark_chapter=next_url
+
+
+        browser.close()
+
