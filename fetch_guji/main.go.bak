@@ -1,0 +1,444 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/chromedp/chromedp"
+)
+
+const baseURL = "https://kandianguji.com"
+
+type Page struct {
+	Page   int    `json:"page"`
+	Title  string `json:"title"`
+	Text   string `json:"text"`
+	Image  string `json:"image_url"`
+	OK     bool   `json:"ok"`
+	Source string `json:"source"`
+}
+
+type Volume struct {
+	ID    string `json:"id"`
+	Order int    `json:"order"`
+	Title string `json:"title"`
+	Card  string `json:"card,omitempty"`
+	Total int    `json:"total"`
+	Pages []Page `json:"pages"`
+}
+
+type BookResult struct {
+	BookID    string    `json:"book_id"`
+	Title     string    `json:"title"`
+	Author    string    `json:"author"`
+	UpdatedAt string    `json:"updated_at"`
+	Volumes   []*Volume `json:"volumes"`
+}
+
+type options struct {
+	book    string
+	out     string
+	tabs    int
+	visible bool
+	delay   int
+	maxPage int
+	onlyVol string
+	chunk   int
+}
+
+func main() {
+	var o options
+	flag.StringVar(&o.book, "book", "105674", "book id")
+	flag.StringVar(&o.out, "out", "output", "output dir")
+	flag.IntVar(&o.tabs, "tabs", 4, "parallel tabs")
+	flag.BoolVar(&o.visible, "visible", false, "show browser window")
+	flag.IntVar(&o.delay, "delay", 120, "delay ms between pages (per tab)")
+	flag.IntVar(&o.maxPage, "max-pages", 0, "debug: limit pages per volume")
+	flag.StringVar(&o.onlyVol, "only-volume", "", "debug: crawl one volume id")
+	flag.IntVar(&o.chunk, "chunk", 15, "pages per JS batch")
+	flag.Parse()
+
+	start := time.Now()
+	outDir := filepath.Join(o.out, o.book)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		fatal(err)
+	}
+	os.MkdirAll(outDir, 0o755)
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+		chromedp.WindowSize(1440, 1000),
+		chromedp.Flag("blink-settings", "imagesEnabled=false"),
+	)
+	if !o.visible {
+		opts = append(opts, chromedp.Flag("headless", true))
+	} else {
+		opts = append(opts, chromedp.Flag("headless", false))
+	}
+	for _, p := range []string{
+		"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+		"/Applications/Chromium.app/Contents/MacOS/Chromium",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			opts = append(opts, chromedp.ExecPath(p))
+			break
+		}
+	}
+
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
+
+	// 1) 取书目与分卷列表
+	bookCtx, cancelBook := chromedp.NewContext(allocCtx)
+	defer cancelBook()
+	bookCtx, cancelT := context.WithTimeout(bookCtx, 120*time.Second)
+	defer cancelT()
+
+	volumes, meta, err := discoverVolumes(bookCtx, o.book)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("书目: %s %s, 共 %d 卷\n", meta.Title, meta.Author, len(volumes))
+	for i, v := range volumes {
+		fmt.Printf("  卷%d id=%s %s\n", i+1, v.ID, v.Title)
+	}
+	if o.onlyVol != "" {
+		var keep []*Volume
+		for _, v := range volumes {
+			if v.ID == o.onlyVol {
+				keep = append(keep, v)
+			}
+		}
+		volumes = keep
+	}
+
+	res := &BookResult{BookID: o.book, Title: meta.Title, Author: meta.Author, UpdatedAt: time.Now().Format(time.RFC3339)}
+	res.Volumes = volumes
+
+	// 2) 并行抓每卷
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		sem  = make(chan struct{}, maxInt(o.tabs, 1))
+		pgs  = 0
+		fail = 0
+	)
+	for i, v := range volumes {
+		wg.Add(1)
+		job := struct {
+			idx int
+			vol *Volume
+		}{i, v}
+		go func(idx int, v *Volume) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			volCtx, cancel := chromedp.NewContext(allocCtx)
+			defer cancel()
+			volCtx, ct := context.WithTimeout(volCtx, time.Duration(60+o.maxPage+600)*time.Second)
+			defer ct()
+
+			err := crawlVolume(volCtx, o.book, v, o.chunk, o.maxPage, o.delay)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				fail++
+				fmt.Printf("[卷%d %s] 失败: %v\n", idx+1, v.Title, err)
+				return
+			}
+			got, total := 0, len(v.Pages)
+			for _, pg := range v.Pages {
+				if pg.OK {
+					got++
+				}
+			}
+			pgs += got
+			fmt.Printf("[卷%d %s] 完成: %d/%d 页有文本 (page_total=%d)\n", idx+1, v.Title, got, total, v.Total)
+			if err := writeVolume(outDir, idx+1, v); err != nil {
+				fmt.Println("写文件失败:", err)
+			}
+		}(job.idx, job.vol)
+		if len(volumes) > 1 {
+			time.Sleep(800 * time.Millisecond) // 错开启动，避免同时打开过多页面
+		}
+	}
+	wg.Wait()
+
+	// 3) 写汇总
+	saveJSON(filepath.Join(outDir, "book.json"), res)
+	writeBookText(filepath.Join(outDir, fmt.Sprintf("%s_%s.txt", o.book, sanitize(meta.Title))), res)
+
+	total, withText := 0, 0
+	for _, v := range res.Volumes {
+		total += len(v.Pages)
+		for _, p := range v.Pages {
+			if p.OK {
+				withText++
+			}
+		}
+	}
+	fmt.Printf("总计: %d 卷, %d 页, %d 页有文本, 失败卷 %d, 耗时 %s\n",
+		len(res.Volumes), total, withText, fail, time.Since(start).Round(time.Second))
+	fmt.Printf("输出目录: %s\n", outDir)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func fatal(err error) {
+	fmt.Println("错误:", err)
+	os.Exit(1)
+}
+
+type bookMeta struct {
+	Title  string
+	Author string
+}
+
+// discoverVolumes 打开书页，抓取书目信息与全部分卷
+func discoverVolumes(ctx context.Context, bookID string) ([]*Volume, bookMeta, error) {
+	var meta bookMeta
+	url := fmt.Sprintf("%s/book/%s?book_id=%s", baseURL, bookID, bookID)
+	err := chromedp.Do(ctx, chromedp.Navigate(url), chromedp.Sleep(2*time.Second))
+	if err != nil {
+		return nil, meta, err
+	}
+	// 等前端渲染出分卷
+	var raw string
+	for i := 0; i < 25; i++ {
+		raw, _ = chromedp.Run(ctx, chromedp.Evaluate[string](fmt.Sprintf(`
+(() => {
+  const bid = %q;
+  const links = [...document.querySelectorAll('a[href*="/volume/"]')];
+  const out = []; const seen = {};
+  for (const a of links) {
+    const h = a.getAttribute('href') || '';
+    const m = h.match(/\/book\/(\d+)\/volume\/(\d+)\/page\/(\d+)/);
+    if (!m || m[1] !== bid) continue;
+    if (seen[m[2]]) continue; seen[m[2]] = 1;
+    const card = a.closest('.card');
+    out.push({vid: m[2], card: card ? card.innerText.replace(/\s+/g, '|').slice(0, 120) : ''});
+  }
+  const bd = (typeof book_data !== 'undefined') ? book_data : null;
+  return JSON.stringify({volumes: out, title: bd ? bd.title : '', author: bd ? bd.author : ''});
+})()
+`, bookID)))
+		if strings.Contains(raw, `"vid"`) && len(raw) > 20 {
+			break
+		}
+		time.Sleep(1 * time.Second)
+	}
+	var parsed struct {
+		Volumes []struct {
+			Vid  string `json:"vid"`
+			Card string `json:"card"`
+		} `json:"volumes"`
+		Title  string `json:"title"`
+		Author string `json:"author"`
+	}
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil, meta, err
+	}
+	meta.Title = parsed.Title
+	meta.Author = parsed.Author
+	if meta.Title == "" || meta.Author == "" {
+		// 回退到 HTML 里的 book_data
+		html, _ := chromedp.Run(ctx, chromedp.Evaluate[string](
+			`(typeof book_data !== 'undefined') ? JSON.stringify({t: book_data.title, a: book_data.author}) : '{}'`))
+		var bd struct {
+			T string `json:"t"`
+			A string `json:"a"`
+		}
+		json.Unmarshal([]byte(html), &bd)
+		if meta.Title == "" {
+			meta.Title = bd.T
+		}
+		if meta.Author == "" {
+			meta.Author = bd.A
+		}
+	}
+
+	var vols []*Volume
+	for i, v := range parsed.Volumes {
+		title := pickTitle(v.Card)
+		if title == "" {
+			title = fmt.Sprintf("卷%d", i+1)
+		}
+		vols = append(vols, &Volume{ID: v.Vid, Order: i + 1, Title: title, Card: v.Card})
+	}
+	if len(vols) == 0 {
+		return nil, meta, fmt.Errorf("未发现分卷: %s", raw)
+	}
+	return vols, meta, nil
+}
+
+func pickTitle(card string) string {
+	// 卡片文本形如: 点击量: 66||《二》||页数：87|点击：66||开始阅读
+	for _, part := range strings.Split(card, "||") {
+		p := strings.TrimSpace(part)
+		if strings.HasPrefix(p, "《") && strings.HasSuffix(p, "》") {
+			return strings.Trim(p, "《》")
+		}
+	}
+	return ""
+}
+
+const jsBatchTemplate = `
+(async () => {
+  const vm = document.querySelector('#app').__vue_app__._instance.proxy;
+  if (!vm) return JSON.stringify({err: 'no vm'});
+  const START = %d, END = %d, DELAY = %d;
+  const pages = vm.pages_data || [];
+  const titleOf = (p) => { const it = pages.find(x => x.sort === p); return it ? (it.title || '') : ''; };
+  const res = [];
+  for (let p = START; p <= END; p++) {
+    let ok = false, text = '', img = '';
+    for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+      try { await vm.navigate_reader(p, {}); } catch (e) {}
+      const dl = performance.now() + 12000;
+      while (performance.now() < dl) {
+        if (vm.page_data && vm.page_data.page == p && (vm.page_data.text || '').length > 0) {
+          ok = true; text = vm.page_data.text; img = vm.page_data.image_url || '';
+          break;
+        }
+        await new Promise(r => setTimeout(r, 25));
+      }
+      if (!ok) await new Promise(r => setTimeout(r, 200 + attempt * 300));
+    }
+    res.push({page: p, ok: ok, text: text, image_url: img, title: titleOf(p)});
+    if (DELAY > 0) await new Promise(r => setTimeout(r, DELAY));
+  }
+  return JSON.stringify(res);
+})()`
+
+func crawlVolume(ctx context.Context, bookID string, v *Volume, chunk, maxPage, delay int) error {
+	url := fmt.Sprintf("%s/book/%s/volume/%s/page/1?book_id=%s&volume_id=%s", baseURL, bookID, v.ID, bookID, v.ID)
+	if err := chromedp.Do(ctx, chromedp.Navigate(url), chromedp.Sleep(2*time.Second)); err != nil {
+		return fmt.Errorf("打开卷首页失败: %w", err)
+	}
+
+	// 等待前端就绪并读取 page_total
+	var total int
+	var vmTitle string
+	for i := 0; i < 30; i++ {
+		raw, _ := chromedp.Run(ctx, chromedp.Evaluate[string](`
+(() => {
+  const vm = document.querySelector('#app') && document.querySelector('#app').__vue_app__ && document.querySelector('#app').__vue_app__._instance.proxy;
+  if (!vm) return '';
+  return JSON.stringify({total: vm.page_total, title: (vm.volume && vm.volume.title) || ''});
+})()
+`))
+		if strings.Contains(raw, `"total"`) {
+			var st struct {
+				Total int    `json:"total"`
+				Title string `json:"title"`
+			}
+			if json.Unmarshal([]byte(raw), &st) == nil && st.Total > 0 {
+				total = st.Total
+				vmTitle = st.Title
+				break
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
+	if total <= 0 {
+		return fmt.Errorf("读取页数失败")
+	}
+	if v.Title == "" || strings.HasPrefix(v.Title, "卷") {
+		if vmTitle != "" {
+			v.Title = vmTitle
+		}
+	}
+	v.Total = total
+
+	end := total
+	if maxPage > 0 && maxPage < end {
+		end = maxPage
+	}
+
+	for start := 1; start <= end; start += chunk {
+		stop := start + chunk - 1
+		if stop > end {
+			stop = end
+		}
+		var got []Page
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			js := fmt.Sprintf(jsBatchTemplate, start, stop, delay)
+			raw, err := chromedp.Run(ctx, chromedp.Evaluate[string](js, chromedp.EvalAwaitPromise))
+			if err != nil {
+				lastErr = err
+				time.Sleep(time.Duration(1+attempt) * time.Second)
+				continue
+			}
+			if err := json.Unmarshal([]byte(raw), &got); err != nil {
+				lastErr = err
+				time.Sleep(time.Duration(1+attempt) * time.Second)
+				continue
+			}
+			lastErr = nil
+			break
+		}
+		if lastErr != nil {
+			return fmt.Errorf("第 %d-%d 页抓取失败: %w", start, stop, lastErr)
+		}
+		v.Pages = append(v.Pages, got...)
+	}
+	sort.Slice(v.Pages, func(i, j int) bool { return v.Pages[i].Page < v.Pages[j].Page })
+	return nil
+}
+
+func writeVolume(outDir string, order int, v *Volume) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "《%s》卷%d 共%d页\n\n", v.Title, order, v.Total)
+	for _, p := range v.Pages {
+		fmt.Fprintf(&b, "第%d页\n%s\n\n", p.Page, p.Text)
+	}
+	path := filepath.Join(outDir, fmt.Sprintf("%02d_%s.txt", order, sanitize(v.Title)))
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeBookText(path string, res *BookResult) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "《%s》 %s\n\n", res.Title, res.Author)
+	for i, v := range res.Volumes {
+		fmt.Fprintf(&b, "===== 卷%d %s (id=%s, %d页) =====\n\n", i+1, v.Title, v.ID, len(v.Pages))
+		for _, p := range v.Pages {
+			fmt.Fprintf(&b, "[第%d页] %s\n", p.Page, p.Text)
+		}
+		b.WriteString("\n")
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func sanitize(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "/", "_")
+	s = strings.ReplaceAll(s, "\\", "_")
+	s = strings.ReplaceAll(s, "\n", "")
+	if s == "" {
+		s = "untitled"
+	}
+	return s
+}
+
+func saveJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}

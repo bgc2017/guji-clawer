@@ -1,0 +1,201 @@
+package main
+// 抓取shidian古籍 step3
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"math/rand"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/playwright-community/playwright-go"
+)
+
+// --- JSON 結構定義 ---
+
+type RawLine struct {
+	Content  string `json:"content"`
+	LineType int    `json:"lineType"`
+}
+
+type InnerContent struct {
+	Lines []RawLine `json:"lines"`
+}
+
+type Paragraph struct {
+	Content string `json:"content"` // 這裡是原始字符串，可能是 JSON
+}
+
+type RootData struct {
+	ParagraphList []Paragraph `json:"paragraphList"`
+}
+
+// --- 全局配置 ---
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Println("用法：go run main.go url_list.txt")
+		os.Exit(1)
+	}
+
+	urlListFile := os.Args[1]
+	urls, err := readLines(urlListFile)
+	if err != nil {
+		log.Fatalf("讀取文件失敗: %v", err)
+	}
+	lineCount := len(urls)
+
+	// 初始化 Playwright
+	pw, err := playwright.Run()
+	if err != nil {
+		log.Fatalf("啟動 Playwright 失敗: %v", err)
+	}
+	browser, err := pw.Chromium.Launch(playwright.BrowserTypeLaunchOptions{
+		Headless: playwright.Bool(true),
+	})
+	if err != nil {
+		log.Fatalf("啟動瀏覽器失敗: %v", err)
+	}
+	defer browser.Close()
+
+	// 設置 Headers
+	headers := map[string]string{
+		"Referer":    "https://www.shidianguji.com/ens/book/DZ1429/",
+		"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36",
+	}
+
+// 修改後
+context, err := browser.NewContext(playwright.BrowserNewContextOptions{
+    ExtraHttpHeaders: headers, // 只有 H 大寫
+})
+	if err != nil {
+		log.Fatalf("創建 Context 失敗: %v", err)
+	}
+
+	// 注入 Cookies
+	cookies := []playwright.OptionalCookie{
+		{Name: "gfkadpd", Value: "361265,34425", Domain: playwright.String("www.shidianguji.com"), Path: playwright.String("/")},
+		{Name: "__is_original", Value: "1", Domain: playwright.String(".shidianguji.com"), Path: playwright.String("/")},
+		{Name: "__is_simplified", Value: "2", Domain: playwright.String(".shidianguji.com"), Path: playwright.String("/")},
+	}
+	context.AddCookies(cookies)
+
+	page, err := context.NewPage()
+	if err != nil {
+		log.Fatalf("創建頁面失敗: %v", err)
+	}
+
+	var lastText string
+	rand.Seed(time.Now().UnixNano())
+
+	// 遍歷 URL 任務
+	for i, rawURL := range urls {
+		idx := i + 1
+		fmt.Printf("INFO - %s [%d/%d]\n", rawURL, idx, lineCount)
+
+		// 隨機短暫休眠 (0.1s 左右)
+		time.Sleep(time.Duration(500+rand.Intn(50)) * time.Millisecond)
+
+		// 拼接 SSR 加載參數
+		targetURL := rawURL + "?__loader=__session%2F(lang%24)/book/%24&__ssrDirect=true"
+
+		_, err := page.Goto(targetURL, playwright.PageGotoOptions{
+			WaitUntil: playwright.WaitUntilStateNetworkidle,
+			Timeout:   playwright.Float(45000),
+		})
+
+		if err != nil {
+			fmt.Printf("ERROR: %v %s\n", err, targetURL)
+			continue
+		}
+
+		html, _ := page.Content()
+		finalText, err := processHTML(html)
+		if err != nil {
+			fmt.Printf("ERROR: %v %s\n", err, rawURL)
+			continue
+		}
+
+		// 跳過重複判斷
+		if !strings.Contains(lastText, finalText) || lastText == "" {
+			lastText = finalText
+			fmt.Println(finalText)
+		} else {
+			fmt.Printf("INFO - SKIP %s\n", rawURL)
+		}
+	}
+}
+
+// processHTML 處理正則提取與 JSON 解析
+func processHTML(html string) (string, error) {
+	// 1. 正則提取 <pre> 內容 (flags=re.S 在 Go 中是 (?s))
+	re := regexp.MustCompile(`(?s)<pre[^>]*>(.*?)</pre>`)
+	matches := re.FindStringSubmatch(html)
+	if len(matches) < 2 {
+		return "", fmt.Errorf("没有找到 <pre> JSON 数据")
+	}
+	jsonText := strings.TrimSpace(matches[1])
+
+	// 2. 第一層 JSON 解析
+	var root RootData
+	if err := json.Unmarshal([]byte(jsonText), &root); err != nil {
+		return "", err
+	}
+
+	var allText []string
+	for _, para := range root.ParagraphList {
+		if para.Content == "" {
+			continue
+		}
+
+		var paragraphLines []string
+		// 3. 第二層 JSON 解析 (內嵌在 content 字符串中)
+		var inner InnerContent
+		err := json.Unmarshal([]byte(para.Content), &inner)
+
+		if err == nil {
+			for _, line := range inner.Lines {
+				if line.Content == "" {
+					continue
+				}
+				text := line.Content
+				if line.LineType == 2 {
+					text = fmt.Sprintf("(%s)", text)
+				}
+				paragraphLines = append(paragraphLines, text)
+			}
+		} else {
+			// 若解析失敗則當作純文本 (對應 Python 的 JSONDecodeError)
+			paragraphLines = append(paragraphLines, para.Content)
+		}
+
+		if len(paragraphLines) > 0 {
+			allText = append(allText, strings.Join(paragraphLines, "")+"XXX")
+		}
+	}
+
+	return strings.Join(allText, ""), nil
+}
+
+// readLines 輔助函數讀取文件
+func readLines(path string) ([]string, error) {
+	content, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(content), "\n")
+	var result []string
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		if t != "" {
+			// 處理原 Python 代碼中的 split("\t")[0]
+			parts := strings.Split(t, "\t")
+			result = append(result, parts[0])
+		}
+	}
+	return result, nil
+}
